@@ -1,111 +1,209 @@
+import asyncio
+import aiohttp
+import json
 import os
 import subprocess
-import json
-import argparse
-from typing import List, Dict
-import requests
-from dotenv import load_dotenv
+import time
+from typing import List, Dict, Any
+from datetime import datetime
 
-# Load environment variables
-load_dotenv()
+import docker
+from prometheus_client import start_http_server, Gauge
 
-# Configuration
-DEFAULT_NODE_COUNT = 5
-GAIANET_INSTALL_SCRIPT = "https://github.com/GaiaNet-AI/gaianet-node/releases/latest/download/install.sh"
-GAIANET_CONFIG_URL = "https://raw.githubusercontent.com/GaiaNet-AI/node-configs/main/ethosnet/config.json"
-
-def install_gaianet() -> None:
-    """Install GaiaNet using the official install script."""
-    print("Installing GaiaNet...")
-    subprocess.run(["curl", "-sSfL", GAIANET_INSTALL_SCRIPT, "|", "bash"], check=True)
-    print("GaiaNet installed successfully.")
-
-def download_config(url: str) -> Dict:
-    """Download and parse the GaiaNet configuration file."""
-    response = requests.get(url)
-    response.raise_for_status()
-    return json.loads(response.text)
-
-def customize_config(config: Dict, node_index: int) -> Dict:
-    """Customize the configuration for each node."""
-    config["node_name"] = f"EthosNet_Node_{node_index}"
-    config["api_port"] = 8080 + node_index  # Ensure unique ports for each node
-    # Add more customizations as needed
-    return config
-
-def init_gaianet_node(config: Dict, node_dir: str) -> None:
-    """Initialize a GaiaNet node with the given configuration."""
-    os.makedirs(node_dir, exist_ok=True)
-    config_path = os.path.join(node_dir, "config.json")
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-    
-    subprocess.run(["gaianet", "init", "--config", config_path], cwd=node_dir, check=True)
-
-def start_gaianet_node(node_dir: str) -> None:
-    """Start a GaiaNet node."""
-    subprocess.Popen(["gaianet", "start"], cwd=node_dir)
-
-def setup_ethereum_account() -> str:
-    """Set up an Ethereum account for the node."""
-    # This is a placeholder. In a real implementation, you would use a secure method to generate
-    # and store Ethereum private keys, possibly using a hardware wallet or key management service.
-    return "0x1234567890123456789012345678901234567890"  # Placeholder Ethereum address
-
-def register_node_on_blockchain(node_address: str, ethereum_address: str) -> None:
-    """Register the node on the EthosNet blockchain."""
-    # This is a placeholder. In a real implementation, you would interact with your smart contract
-    # to register the node.
-    print(f"Registering node {node_address} with Ethereum address {ethereum_address} on the blockchain...")
-
-def setup_nodes(count: int) -> None:
-    """Set up and configure multiple GaiaNet nodes."""
-    install_gaianet()
-    base_config = download_config(GAIANET_CONFIG_URL)
-    
-    for i in range(count):
-        node_dir = f"ethosnet_node_{i}"
-        config = customize_config(base_config, i)
-        init_gaianet_node(config, node_dir)
+class GaiaNetNodeManager:
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self.nodes: Dict[str, Dict[str, Any]] = {}
+        self.client = docker.from_env()
         
-        ethereum_address = setup_ethereum_account()
-        register_node_on_blockchain(config["node_name"], ethereum_address)
+        # Prometheus metrics
+        self.node_health = Gauge('node_health', 'Health status of GaiaNet nodes', ['node_id'])
+        self.node_load = Gauge('node_load', 'Load of GaiaNet nodes', ['node_id'])
+
+    async def setup_nodes(self, node_count: int):
+        for i in range(node_count):
+            node_id = f"node_{i}"
+            config = self._customize_config(i)
+            await self._init_node(node_id, config)
+            await self._start_node(node_id)
         
-        start_gaianet_node(node_dir)
-        print(f"Node {i} set up and started successfully.")
+        # Start monitoring
+        asyncio.create_task(self._monitor_nodes())
 
-def initialize_network(node_count: int) -> None:
-    """Initialize the EthosNet decentralized network."""
-    print(f"Initializing EthosNet network with {node_count} nodes...")
+    async def _init_node(self, node_id: str, config: Dict[str, Any]):
+        node_dir = f"/tmp/gaianet/{node_id}"
+        os.makedirs(node_dir, exist_ok=True)
+        
+        with open(f"{node_dir}/config.json", 'w') as f:
+            json.dump(config, f)
+        
+        subprocess.run(["gaianet", "init", "--config", f"{node_dir}/config.json"], check=True)
+        
+        self.nodes[node_id] = {
+            "status": "initialized",
+            "config": config,
+            "dir": node_dir,
+            "container": None
+        }
+
+    async def _start_node(self, node_id: str):
+        node = self.nodes[node_id]
+        container = self.client.containers.run(
+            "gaianet/node:latest",
+            command=f"gaianet start --config /gaianet/config.json",
+            volumes={node['dir']: {'bind': '/gaianet', 'mode': 'rw'}},
+            ports={'8080/tcp': None},
+            detach=True
+        )
+        node['container'] = container
+        node['status'] = "running"
+        
+        # Wait for the node to be ready
+        while True:
+            try:
+                response = await self._make_request(node_id, "/health")
+                if response.get('status') == 'ok':
+                    break
+            except:
+                await asyncio.sleep(1)
+
+    async def _stop_node(self, node_id: str):
+        node = self.nodes[node_id]
+        if node['container']:
+            node['container'].stop()
+            node['container'].remove()
+            node['container'] = None
+        node['status'] = "stopped"
+
+    async def _restart_node(self, node_id: str):
+        await self._stop_node(node_id)
+        await self._start_node(node_id)
+
+    async def _make_request(self, node_id: str, endpoint: str) -> Dict[str, Any]:
+        node = self.nodes[node_id]
+        port = node['container'].ports['8080/tcp'][0]['HostPort']
+        url = f"http://localhost:{port}{endpoint}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                return await response.json()
+
+    def _customize_config(self, node_index: int) -> Dict[str, Any]:
+        with open(self.config_path, 'r') as f:
+            base_config = json.load(f)
+        
+        # Customize config based on node index
+        base_config['node_name'] = f"EthosNet_Node_{node_index}"
+        base_config['port'] = 8080 + node_index
+        
+        return base_config
+
+    async def _monitor_nodes(self):
+        while True:
+            for node_id, node in self.nodes.items():
+                try:
+                    health = await self._check_node_health(node_id)
+                    load = await self._check_node_load(node_id)
+                    
+                    self.node_health.labels(node_id=node_id).set(1 if health['status'] == 'ok' else 0)
+                    self.node_load.labels(node_id=node_id).set(load['cpu_usage'])
+                    
+                    if health['status'] != 'ok':
+                        print(f"Node {node_id} is unhealthy. Attempting recovery...")
+                        await self._recover_node(node_id)
+                except Exception as e:
+                    print(f"Error monitoring node {node_id}: {str(e)}")
+            
+            await asyncio.sleep(60)  # Check every minute
+
+    async def _check_node_health(self, node_id: str) -> Dict[str, Any]:
+        try:
+            return await self._make_request(node_id, "/health")
+        except:
+            return {"status": "error"}
+
+    async def _check_node_load(self, node_id: str) -> Dict[str, Any]:
+        try:
+            stats = self.nodes[node_id]['container'].stats(stream=False)
+            cpu_usage = stats['cpu_stats']['cpu_usage']['total_usage'] / stats['cpu_stats']['system_cpu_usage'] * 100
+            return {"cpu_usage": cpu_usage}
+        except:
+            return {"cpu_usage": 0}
+
+    async def _recover_node(self, node_id: str):
+        try:
+            await self._restart_node(node_id)
+            print(f"Node {node_id} recovered successfully.")
+        except Exception as e:
+            print(f"Failed to recover node {node_id}: {str(e)}")
+
+    async def load_balance(self):
+        while True:
+            node_loads = {}
+            for node_id in self.nodes:
+                load = await self._check_node_load(node_id)
+                node_loads[node_id] = load['cpu_usage']
+            
+            avg_load = sum(node_loads.values()) / len(node_loads)
+            
+            for node_id, load in node_loads.items():
+                if load > avg_load * 1.2:  # Node is overloaded
+                    least_loaded_node = min(node_loads, key=node_loads.get)
+                    await self._migrate_workload(node_id, least_loaded_node)
+            
+            await asyncio.sleep(300)  # Check every 5 minutes
+
+    async def _migrate_workload(self, source_node: str, target_node: str):
+        # This is a placeholder for workload migration logic
+        # In a real implementation, this would involve moving specific tasks or data
+        # between nodes to balance the load
+        print(f"Migrating workload from {source_node} to {target_node}")
+
+    async def scale_nodes(self, target_count: int):
+        current_count = len(self.nodes)
+        if target_count > current_count:
+            for i in range(current_count, target_count):
+                node_id = f"node_{i}"
+                config = self._customize_config(i)
+                await self._init_node(node_id, config)
+                await self._start_node(node_id)
+        elif target_count < current_count:
+            nodes_to_remove = list(self.nodes.keys())[target_count:]
+            for node_id in nodes_to_remove:
+                await self._stop_node(node_id)
+                del self.nodes[node_id]
+
+    def start_prometheus_exporter(self, port: int = 8000):
+        start_http_server(port)
+
+async def main():
+    config_path = "gaianet_base_config.json"
+    node_manager = GaiaNetNodeManager(config_path)
     
-    # Set up nodes
-    setup_nodes(node_count)
+    # Start Prometheus exporter
+    node_manager.start_prometheus_exporter()
     
-    # Additional network initialization steps
-    initialize_smart_contracts()
-    initialize_governance()
+    # Initial setup
+    await node_manager.setup_nodes(3)  # Start with 3 nodes
     
-    print("EthosNet network initialized successfully.")
-
-def initialize_smart_contracts() -> None:
-    """Deploy and initialize smart contracts for EthosNet."""
-    # This is a placeholder. In a real implementation, you would deploy your smart contracts
-    # to the blockchain and initialize them with any necessary parameters.
-    print("Deploying and initializing EthosNet smart contracts...")
-
-def initialize_governance() -> None:
-    """Set up the initial governance structure for EthosNet."""
-    # This is a placeholder. In a real implementation, you would set up the initial
-    # governance parameters, possibly including setting up a DAO structure.
-    print("Initializing EthosNet governance structure...")
-
-def main():
-    parser = argparse.ArgumentParser(description="Set up and initialize the EthosNet network.")
-    parser.add_argument("--node-count", type=int, default=DEFAULT_NODE_COUNT,
-                        help=f"Number of nodes to set up (default: {DEFAULT_NODE_COUNT})")
-    args = parser.parse_args()
-
-    initialize_network(args.node_count)
+    # Start load balancing task
+    asyncio.create_task(node_manager.load_balance())
+    
+    # Main loop
+    while True:
+        command = input("Enter command (status/scale/quit): ")
+        if command == "status":
+            for node_id, node in node_manager.nodes.items():
+                print(f"{node_id}: {node['status']}")
+        elif command.startswith("scale"):
+            try:
+                target_count = int(command.split()[1])
+                await node_manager.scale_nodes(target_count)
+            except:
+                print("Invalid scale command. Use 'scale <number>'")
+        elif command == "quit":
+            break
+        else:
+            print("Unknown command")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

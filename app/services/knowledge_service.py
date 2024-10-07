@@ -1,212 +1,283 @@
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-from app.core.vector_db import VectorDB
-from app.core.llm import LLM
-from app.api.models import KnowledgeEntry, KnowledgeEntryCreate, KnowledgeEntryUpdate, SearchResult
-from app.core.smart_contract import SmartContract
+from typing import List, Dict, Any
+from datetime import datetime, timedelta
+from uuid import uuid4
+from app.core.config import settings
+from app.models.knowledge import KnowledgeEntry, ReviewStatus
+from app.services.llm_service import LLMService
+from app.services.vector_db_service import VectorDBService
+from app.services.reputation_service import ReputationService
+from app.services.smart_contract_service import SmartContractService
 
 class KnowledgeService:
-    def __init__(self, vector_db: VectorDB, llm: LLM, smart_contract: SmartContract):
-        self.vector_db = vector_db
-        self.llm = llm
-        self.smart_contract = smart_contract
+    def __init__(
+        self,
+        llm_service: LLMService,
+        vector_db_service: VectorDBService,
+        reputation_service: ReputationService,
+        smart_contract_service: SmartContractService
+    ):
+        self.llm_service = llm_service
+        self.vector_db_service = vector_db_service
+        self.reputation_service = reputation_service
+        self.smart_contract_service = smart_contract_service
 
-    async def add_entry(self, entry: KnowledgeEntryCreate) -> str:
-        """
-        Add a new entry to the knowledge base.
-        
-        Args:
-            entry (KnowledgeEntryCreate): The entry to be added.
-        
-        Returns:
-            str: The ID of the newly added entry.
-        """
-        embedding = self.llm.embed(entry.content)
-        entry_id = self.vector_db.add(embedding, entry.content, entry.metadata)
-        
+    async def add_entry(self, content: str, metadata: Dict[str, Any], author_id: str) -> str:
+        # Generate an embedding for the content
+        embedding = await self.llm_service.get_embedding(content)
+
+        # Create a new knowledge entry
+        entry_id = str(uuid4())
+        entry = KnowledgeEntry(
+            id=entry_id,
+            content=content,
+            metadata=metadata,
+            author_id=author_id,
+            embedding=embedding,
+            created_at=datetime.now(),
+            last_reviewed_at=None,
+            review_status=ReviewStatus.PENDING,
+            quality_score=0,
+            relevance_score=0,
+            version=1
+        )
+
+        # Store the entry in the vector database
+        await self.vector_db_service.add_item(
+            collection_name="knowledge_base",
+            item=entry.dict()
+        )
+
+        # Trigger the review process
+        await self._trigger_review(entry_id)
+
         # Record the contribution on the blockchain
-        self.smart_contract.record_contribution(entry_id, "knowledge_addition")
-        
+        await self.smart_contract_service.record_knowledge_contribution(
+            author_id=author_id,
+            entry_id=entry_id,
+            timestamp=entry.created_at
+        )
+
         return entry_id
 
-    async def get_entry(self, entry_id: str) -> Optional[KnowledgeEntry]:
-        """
-        Retrieve a specific knowledge entry.
-        
-        Args:
-            entry_id (str): The ID of the entry to retrieve.
-        
-        Returns:
-            Optional[KnowledgeEntry]: The retrieved entry, or None if not found.
-        """
-        entry = self.vector_db.get(entry_id)
-        if entry:
-            return KnowledgeEntry(
-                id=entry_id,
-                content=entry['content'],
-                metadata=entry['metadata'],
-                created_at=entry['metadata'].get('created_at', datetime.now()),
-                updated_at=entry['metadata'].get('updated_at', datetime.now())
-            )
-        return None
+    async def get_entry(self, entry_id: str) -> KnowledgeEntry:
+        entry_data = await self.vector_db_service.get_item(
+            collection_name="knowledge_base",
+            id=entry_id
+        )
+        return KnowledgeEntry(**entry_data)
 
-    async def update_entry(self, entry_id: str, update: KnowledgeEntryUpdate) -> bool:
-        """
-        Update an existing knowledge entry.
-        
-        Args:
-            entry_id (str): The ID of the entry to update.
-            update (KnowledgeEntryUpdate): The update to apply.
-        
-        Returns:
-            bool: True if the update was successful, False otherwise.
-        """
-        existing_entry = self.vector_db.get(entry_id)
-        if not existing_entry:
-            return False
+    async def update_entry(self, entry_id: str, content: str, metadata: Dict[str, Any], author_id: str) -> bool:
+        # Retrieve the existing entry
+        existing_entry = await self.get_entry(entry_id)
 
-        updated_content = update.content or existing_entry['content']
-        updated_metadata = {**existing_entry['metadata'], **(update.metadata or {})}
-        updated_metadata['updated_at'] = datetime.now()
+        # Check if the author is allowed to update the entry
+        if existing_entry.author_id != author_id:
+            raise PermissionError("Only the original author can update the entry.")
 
-        if update.content:
-            new_embedding = self.llm.embed(updated_content)
-            self.vector_db.update(entry_id, updated_content, updated_metadata, new_embedding)
-        else:
-            self.vector_db.update(entry_id, updated_content, updated_metadata)
+        # Generate a new embedding for the updated content
+        new_embedding = await self.llm_service.get_embedding(content)
 
-        # Record the update on the blockchain
-        self.smart_contract.record_contribution(entry_id, "knowledge_update")
+        # Create an updated entry
+        updated_entry = KnowledgeEntry(
+            **existing_entry.dict(),
+            content=content,
+            metadata=metadata,
+            embedding=new_embedding,
+            last_reviewed_at=None,
+            review_status=ReviewStatus.PENDING,
+            version=existing_entry.version + 1
+        )
+
+        # Store the updated entry in the vector database
+        await self.vector_db_service.update_item(
+            collection_name="knowledge_base",
+            id=entry_id,
+            item=updated_entry.dict()
+        )
+
+        # Trigger the review process
+        await self._trigger_review(entry_id)
 
         return True
 
-    async def delete_entry(self, entry_id: str) -> bool:
-        """
-        Delete a knowledge entry.
-        
-        Args:
-            entry_id (str): The ID of the entry to delete.
-        
-        Returns:
-            bool: True if the deletion was successful, False otherwise.
-        """
-        try:
-            self.vector_db.delete(entry_id)
-            
-            # Record the deletion on the blockchain
-            self.smart_contract.record_contribution(entry_id, "knowledge_deletion")
-            
-            return True
-        except Exception:
-            return False
+    async def delete_entry(self, entry_id: str, requester_id: str) -> bool:
+        # Retrieve the existing entry
+        existing_entry = await self.get_entry(entry_id)
 
-    async def search_entries(self, query: str, limit: int = 5) -> List[SearchResult]:
-        """
-        Search the knowledge base for relevant entries.
-        
-        Args:
-            query (str): The search query.
-            limit (int): The maximum number of results to return.
-        
-        Returns:
-            List[SearchResult]: A list of search results.
-        """
-        query_embedding = self.llm.embed(query)
-        results = self.vector_db.search(query_embedding, limit)
-        
-        return [
-            SearchResult(
-                id=result['id'],
-                content=result['content'],
-                metadata=result['metadata'],
-                score=result['score']
-            )
-            for result in results
-        ]
+        # Check if the requester is allowed to delete the entry
+        if existing_entry.author_id != requester_id:
+            raise PermissionError("Only the original author can delete the entry.")
 
-    async def generate_summary(self, topic: str) -> str:
+        # Remove the entry from the vector database
+        await self.vector_db_service.delete_item(
+            collection_name="knowledge_base",
+            id=entry_id
+        )
+
+        # Record the deletion on the blockchain
+        await self.smart_contract_service.record_knowledge_deletion(
+            author_id=requester_id,
+            entry_id=entry_id,
+            timestamp=datetime.now()
+        )
+
+        return True
+
+    async def search_entries(self, query: str, limit: int = 10) -> List[KnowledgeEntry]:
+        # Generate an embedding for the query
+        query_embedding = await self.llm_service.get_embedding(query)
+
+        # Search for similar entries in the vector database
+        similar_entries = await self.vector_db_service.search_similar(
+            collection_name="knowledge_base",
+            query_vector=query_embedding,
+            limit=limit
+        )
+
+        return [KnowledgeEntry(**entry) for entry in similar_entries]
+
+    async def _trigger_review(self, entry_id: str):
+        # Retrieve the entry
+        entry = await self.get_entry(entry_id)
+
+        # Use LLM to assess the quality and relevance of the entry
+        assessment = await self._assess_entry(entry)
+
+        # Update the entry with the assessment results
+        entry.quality_score = assessment["quality_score"]
+        entry.relevance_score = assessment["relevance_score"]
+        entry.review_status = ReviewStatus.REVIEWED if assessment["approved"] else ReviewStatus.REJECTED
+
+        # Store the updated entry
+        await self.vector_db_service.update_item(
+            collection_name="knowledge_base",
+            id=entry_id,
+            item=entry.dict()
+        )
+
+        # Update author's reputation based on the entry's quality and relevance
+        reputation_change = (entry.quality_score + entry.relevance_score) / 2
+        await self.reputation_service.update_reputation(
+            user_id=entry.author_id,
+            change=reputation_change,
+            reason=f"Knowledge entry {entry_id} review"
+        )
+
+        # If the entry is rejected, notify the author
+        if entry.review_status == ReviewStatus.REJECTED:
+            await self._notify_author_of_rejection(entry.author_id, entry_id, assessment["feedback"])
+
+    async def _assess_entry(self, entry: KnowledgeEntry) -> Dict[str, Any]:
+        prompt = f"""
+        Assess the following knowledge entry for the EthosNet system:
+
+        Content: {entry.content}
+        Metadata: {entry.metadata}
+
+        Provide an assessment including:
+        1. Quality score (0-100): How well-written, accurate, and valuable is the content?
+        2. Relevance score (0-100): How relevant is this entry to AI ethics and responsible AI development?
+        3. Approval status (true/false): Should this entry be approved for inclusion in the knowledge base?
+        4. Feedback: Provide constructive feedback, especially if the entry is not approved.
+
+        Format your response as a JSON object.
         """
-        Generate a summary on a given topic using the knowledge base.
+        return await self.llm_service.generate_json(prompt)
+
+    async def _notify_author_of_rejection(self, author_id: str, entry_id: str, feedback: str):
+        # In a real system, this would send a notification to the author
+        # For now, we'll just print the information
+        print(f"Notification to author {author_id}: Your knowledge entry {entry_id} was rejected.")
+        print(f"Feedback: {feedback}")
+
+    async def periodic_reevaluation(self):
+        # Get all entries that haven't been reviewed in the last 30 days
+        thirty_days_ago = datetime.now() - timedelta(days=30)
+        entries_to_review = await self.vector_db_service.search(
+            collection_name="knowledge_base",
+            query_filter={"last_reviewed_at": {"$lt": thirty_days_ago}}
+        )
+
+        for entry in entries_to_review:
+            await self._trigger_review(entry["id"])
+
+    async def get_community_reviewed_entries(self, limit: int = 10) -> List[KnowledgeEntry]:
+        # Get entries that have been approved and have high quality and relevance scores
+        high_quality_entries = await self.vector_db_service.search(
+            collection_name="knowledge_base",
+            query_filter={
+                "review_status": ReviewStatus.REVIEWED,
+                "quality_score": {"$gt": 80},
+                "relevance_score": {"$gt": 80}
+            },
+            limit=limit
+        )
+
+        return [KnowledgeEntry(**entry) for entry in high_quality_entries]
+
+    async def submit_community_review(self, entry_id: str, reviewer_id: str, review_score: int, review_comment: str) -> bool:
+        # Retrieve the entry
+        entry = await self.get_entry(entry_id)
+
+        # Check if the reviewer has sufficient reputation to submit a review
+        reviewer_reputation = await self.reputation_service.get_reputation(reviewer_id)
+        if reviewer_reputation < settings.MIN_REPUTATION_FOR_REVIEW:
+            raise PermissionError("Insufficient reputation to submit a review.")
+
+        # Record the community review
+        review_id = str(uuid4())
+        await self.vector_db_service.add_item(
+            collection_name="community_reviews",
+            item={
+                "id": review_id,
+                "entry_id": entry_id,
+                "reviewer_id": reviewer_id,
+                "review_score": review_score,
+                "review_comment": review_comment,
+                "timestamp": datetime.now()
+            }
+        )
+
+        # Update the entry's overall scores
+        all_reviews = await self.vector_db_service.search(
+            collection_name="community_reviews",
+            query_filter={"entry_id": entry_id}
+        )
+        avg_score = sum(review["review_score"] for review in all_reviews) / len(all_reviews)
+        entry.quality_score = (entry.quality_score + avg_score) / 2
         
-        Args:
-            topic (str): The topic to summarize.
-        
-        Returns:
-            str: The generated summary.
-        """
+        # Update the entry in the vector database
+        await self.vector_db_service.update_item(
+            collection_name="knowledge_base",
+            id=entry_id,
+            item=entry.dict()
+        )
+
+        # Update reviewer's reputation
+        await self.reputation_service.update_reputation(
+            user_id=reviewer_id,
+            change=settings.REPUTATION_CHANGE_FOR_REVIEW,
+            reason=f"Submitted review for entry {entry_id}"
+        )
+
+        return True
+
+    async def generate_knowledge_summary(self, topic: str) -> str:
         # Search for relevant entries
-        relevant_entries = await self.search_entries(topic, limit=10)
+        relevant_entries = await self.search_entries(topic, limit=5)
         
         # Combine the content of relevant entries
-        context = "\n\n".join([entry.content for entry in relevant_entries])
+        combined_content = "\n\n".join([entry.content for entry in relevant_entries])
         
-        # Use the LLM to generate a summary
-        summary_prompt = f"Summarize the following information about '{topic}':\n\n{context}\n\nSummary:"
-        summary = self.llm.generate(summary_prompt, max_length=300)
+        # Use LLM to generate a summary
+        prompt = f"""
+        Given the following information about {topic}:
+
+        {combined_content}
+
+        Generate a concise summary that captures the key points and insights.
+        The summary should be informative and relevant to AI ethics and responsible AI development.
+        """
         
+        summary = await self.llm_service.generate_text(prompt)
         return summary
-
-    async def curate_entries(self, threshold: float = 0.7) -> List[str]:
-        """
-        Curate the knowledge base by identifying and flagging low-quality entries.
-        
-        Args:
-            threshold (float): The quality threshold for entries.
-        
-        Returns:
-            List[str]: A list of IDs of entries flagged for review.
-        """
-        all_entries = self.vector_db.get_all_entries()
-        flagged_entries = []
-
-        for entry in all_entries:
-            quality_score = self.assess_entry_quality(entry)
-            if quality_score < threshold:
-                flagged_entries.append(entry['id'])
-                self.flag_entry_for_review(entry['id'])
-
-        return flagged_entries
-
-    def assess_entry_quality(self, entry: Dict[str, Any]) -> float:
-        """
-        Assess the quality of a knowledge entry.
-        
-        Args:
-            entry (Dict[str, Any]): The entry to assess.
-        
-        Returns:
-            float: A quality score between 0 and 1.
-        """
-        # This is a placeholder implementation. In a real-world scenario,
-        # you would implement more sophisticated quality assessment logic.
-        quality_prompt = f"Assess the quality and relevance of the following content. Provide a score between 0 and 1, where 1 is highest quality:\n\n{entry['content']}\n\nQuality score:"
-        quality_score = float(self.llm.generate(quality_prompt, max_length=10).strip())
-        return min(max(quality_score, 0), 1)  # Ensure the score is between 0 and 1
-
-    def flag_entry_for_review(self, entry_id: str):
-        """
-        Flag a knowledge entry for review.
-        
-        Args:
-            entry_id (str): The ID of the entry to flag.
-        """
-        entry = self.vector_db.get(entry_id)
-        if entry:
-            updated_metadata = entry['metadata'] or {}
-            updated_metadata['flagged_for_review'] = True
-            updated_metadata['flagged_at'] = datetime.now().isoformat()
-            self.vector_db.update(entry_id, entry['content'], updated_metadata)
-
-    async def get_entry_history(self, entry_id: str) -> List[Dict[str, Any]]:
-        """
-        Get the history of changes for a knowledge entry.
-        
-        Args:
-            entry_id (str): The ID of the entry.
-        
-        Returns:
-            List[Dict[str, Any]]: A list of historical versions of the entry.
-        """
-        # This is a placeholder. In a real implementation, you would need to
-        # store and retrieve historical versions of entries.
-        return [{"version": 1, "content": "Initial version", "timestamp": "2023-01-01T00:00:00"}]
