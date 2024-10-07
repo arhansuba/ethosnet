@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EthosNet - Ethical AI Development Platform</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header>
+        <h1>EthosNet</h1>
+        <nav>
+            <ul>
+                <li><a href="#ethics">Ethics Evaluation</a></li>
+                <li><a href="#knowledge">Knowledge Base</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <section id="ethics">
+            <h2>Ethics Evaluation</h2>
+            <form id="ethics-form">
+                <label for="decision">AI Decision:</label>
+                <textarea id="decision" required></textarea>
+                <button type="submit">Evaluate</button>
+            </form>
+            <div id="ethics-result"></div>
+        </section>
+
+        <section id="knowledge">
+            <h2>Knowledge Base</h2>
+            <div id="knowledge-actions">
+                <form id="search-form">
+                    <input type="text" id="search-query" placeholder="Search knowledge base..." required>
+                    <button type="submit">Search</button>
+                </form>
+                <button id="add-knowledge-btn">Add New Entry</button>
+            </div>
+            <div id="knowledge-results"></div>
+            <div id="add-knowledge-form" style="display: none;">
+                <h3>Add New Knowledge Entry</h3>
+                <form id="knowledge-form">
+                    <label for="title">Title:</label>
+                    <input type="text" id="title" required>
+                    <label for="content">Content:</label>
+                    <textarea id="content" required></textarea>
+                    <label for="tags">Tags (comma-separated):</label>
+                    <input type="text" id="tags">
+                    <button type="submit">Submit</button>
+                </form>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2023 EthosNet. All rights reserved.</p>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>
